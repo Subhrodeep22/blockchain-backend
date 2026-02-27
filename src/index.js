@@ -1,3 +1,6 @@
+/*************************************************
+ * CONFIG / PROVIDER
+ *************************************************/
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -7,7 +10,6 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// -------- Provider & Wallet --------
 let provider;
 let wallet;
 let contract;
@@ -17,7 +19,7 @@ if (process.env.RPC_URL && process.env.PRIVATE_KEY) {
   wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
 }
 
-// -------- Load ABI --------
+// Load ABI safely
 let abi = [];
 try {
   abi = require("./abi.json");
@@ -25,7 +27,6 @@ try {
   abi = [];
 }
 
-// -------- Initialize Contract --------
 if (wallet && process.env.CONTRACT_ADDRESS && abi.length > 0) {
   contract = new ethers.Contract(
     process.env.CONTRACT_ADDRESS,
@@ -34,7 +35,9 @@ if (wallet && process.env.CONTRACT_ADDRESS && abi.length > 0) {
   );
 }
 
-// -------- Utility: Hash Function --------
+/*************************************************
+ * UTILS / HASH
+ *************************************************/
 const hashCertificate = (studentName, course) => {
   const encoded = ethers.AbiCoder.defaultAbiCoder().encode(
     ["string", "string"],
@@ -43,64 +46,115 @@ const hashCertificate = (studentName, course) => {
   return ethers.keccak256(encoded);
 };
 
-// -------- In-Memory Store --------
+/*************************************************
+ * IN-MEMORY DATABASE
+ *************************************************/
 let issuedCertificates = [];
 
-// -------- Routes --------
+/*************************************************
+ * SERVICES / BLOCKCHAIN
+ *************************************************/
+const issueOnBlockchain = async (certId, hash) => {
+  if (!contract) throw new Error("Contract not configured yet");
 
-app.get("/health", (req, res) => {
-  res.json({ status: "OK" });
-});
+  const tx = await contract.issueCertificate(certId, hash);
+  await tx.wait();
+  return tx.hash;
+};
 
-app.post("/certificates", async (req, res) => {
+const verifyOnBlockchain = async (certId) => {
+  if (!contract) throw new Error("Contract not configured yet");
+
+  return await contract.verifyCertificate(certId);
+};
+
+/*************************************************
+ * CONTROLLERS
+ *************************************************/
+const issueCertificate = async (req, res, next) => {
   try {
     const { certId, studentName, course } = req.body;
 
+    // Basic Validation
     if (!certId || !studentName || !course) {
-      return res.status(400).json({ error: "All fields required" });
+      return res.status(400).json({
+        error: "certId, studentName and course are required"
+      });
     }
 
-    if (!contract) {
-      return res.json({ error: "Contract not configured yet" });
+    // Prevent duplicate IDs
+    if (issuedCertificates.includes(certId)) {
+      return res.status(400).json({
+        error: "Certificate ID already issued"
+      });
     }
 
     const hash = hashCertificate(studentName, course);
-
-    const tx = await contract.issueCertificate(certId, hash);
-    await tx.wait();
+    const txHash = await issueOnBlockchain(certId, hash);
 
     issuedCertificates.push(certId);
 
     res.json({
-      message: "Certificate Issued",
-      txHash: tx.hash
+      message: "Certificate Issued Successfully",
+      txHash
     });
 
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
-});
+};
 
-app.get("/certificates/:id", async (req, res) => {
+const verifyCertificate = async (req, res, next) => {
   try {
-    if (!contract) {
-      return res.json({ error: "Contract not configured yet" });
+    const certId = req.params.id;
+
+    if (!certId) {
+      return res.status(400).json({ error: "certId required" });
     }
 
-    const hash = await contract.verifyCertificate(req.params.id);
+    const hash = await verifyOnBlockchain(certId);
 
-    res.json({ certId: req.params.id, hash });
+    res.json({
+      certId,
+      hash
+    });
 
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    next(err);
   }
+};
+
+const listCertificates = (req, res) => {
+  res.json({
+    total: issuedCertificates.length,
+    certificates: issuedCertificates
+  });
+};
+
+/*************************************************
+ * ROUTES
+ *************************************************/
+app.get("/health", (req, res) => {
+  res.json({ status: "OK" });
 });
 
-app.get("/certificates", (req, res) => {
-  res.json({ issuedCertificates });
+app.post("/api/certificates", issueCertificate);
+app.get("/api/certificates/:id", verifyCertificate);
+app.get("/api/certificates", listCertificates);
+
+/*************************************************
+ * ERROR HANDLER (Middleware)
+ *************************************************/
+app.use((err, req, res, next) => {
+  console.error(err.message);
+  res.status(500).json({
+    error: err.message || "Internal Server Error"
+  });
 });
 
-// -------- Start Server --------
+/*************************************************
+ * SERVER START
+ *************************************************/
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
